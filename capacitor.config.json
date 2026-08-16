@@ -1,0 +1,6 @@
+{
+  "appId": "com.arcadehub.premium",
+  "appName": "Arcade Hub Premium",
+  "webDir": ".",
+  "bundledWebRuntime": false
+}

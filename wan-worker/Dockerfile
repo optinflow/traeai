@@ -1,6 +1,6 @@
 # Wan 2.2 Animate serverless worker for RunPod.
 # Base: official RunPod ComfyUI worker (ComfyUI + handler + start scripts).
-FROM runpod/worker-comfyui:5.11.0-base
+FROM runpod/worker-comfyui:5.10.0-base
 
 # Custom nodes for the Wan Animate replace workflow
 # (KJNodes helpers, DWPose via controlnet_aux, SAM2 segmentation).

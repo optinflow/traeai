@@ -60,43 +60,6 @@ COMFY_HOST = "127.0.0.1:8188"
 REFRESH_WORKER = os.environ.get("REFRESH_WORKER", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
-# Model loader nodes — used for pre-flight validation of workflow model refs
-# ---------------------------------------------------------------------------
-# Maps a loader node's class_type to the model type it loads and the input
-# field(s) that name a model file. The node → directory mapping is ComfyUI
-# domain knowledge (documented in AGENTS.md), not discoverable from code.
-MODEL_LOADER_NODES = {
-    "CheckpointLoaderSimple": ("checkpoints", ("ckpt_name",)),
-    "LoraLoader": ("loras", ("lora_name",)),
-    "VAELoader": ("vae", ("vae_name",)),
-    "DualCLIPLoader": ("text_encoders", ("clip_name1", "clip_name2")),
-    "TripleCLIPLoader": ("text_encoders", ("clip_name1", "clip_name2", "clip_name3")),
-    "UNETLoader": ("diffusion_models", ("unet_name",)),
-    "UnetLoaderGGUF": ("diffusion_models", ("unet_name",)),
-    "Hy3DModelLoader": ("diffusion_models", ("model",)),
-    "UpscaleModelLoader": ("upscale_models", ("model_name",)),
-}
-
-# Where each model type lives on the network volume (see
-# src/extra_model_paths.yaml — text encoders mount under clip/ and diffusion
-# models under unet/, their legacy ComfyUI directory names).
-MODEL_TYPE_VOLUME_DIRS = {
-    "checkpoints": "/runpod-volume/models/checkpoints/",
-    "loras": "/runpod-volume/models/loras/",
-    "vae": "/runpod-volume/models/vae/",
-    "text_encoders": "/runpod-volume/models/clip/",
-    "diffusion_models": "/runpod-volume/models/unet/",
-    "upscale_models": "/runpod-volume/models/upscale_models/",
-}
-
-# Placeholder some clients send when a UI model dropdown was never resolved
-# to a real filename.
-MODEL_LIST_PLACEHOLDER = "__list__"
-
-# Cap how many available files an error message lists before truncating
-MAX_LISTED_MODELS = 15
-
-# ---------------------------------------------------------------------------
 # Helper: quick reachability probe of ComfyUI HTTP endpoint (port 8188)
 # ---------------------------------------------------------------------------
 
@@ -410,233 +373,33 @@ def upload_images(images):
     }
 
 
-def _fetch_object_info():
+def get_available_models():
     """
-    Fetch ComfyUI's /object_info (registered nodes and their input options).
+    Get list of available models from ComfyUI
 
     Returns:
-        dict: The parsed /object_info payload, or None if it can't be fetched.
+        dict: Dictionary containing available models by type
     """
     try:
         response = requests.get(f"http://{COMFY_HOST}/object_info", timeout=10)
         response.raise_for_status()
-        return response.json()
+        object_info = response.json()
+
+        # Extract available checkpoints from CheckpointLoaderSimple
+        available_models = {}
+        if "CheckpointLoaderSimple" in object_info:
+            checkpoint_info = object_info["CheckpointLoaderSimple"]
+            if "input" in checkpoint_info and "required" in checkpoint_info["input"]:
+                ckpt_options = checkpoint_info["input"]["required"].get("ckpt_name")
+                if ckpt_options and len(ckpt_options) > 0:
+                    available_models["checkpoints"] = (
+                        ckpt_options[0] if isinstance(ckpt_options[0], list) else []
+                    )
+
+        return available_models
     except Exception as e:
-        print(f"worker-comfyui - Warning: Could not fetch /object_info: {e}")
-        return None
-
-
-def _loader_field_options(object_info, class_type, field):
-    """
-    Return the list of valid options for a node input field, or None when the
-    node/field is not registered or the field is not an option list.
-    """
-    node_info = object_info.get(class_type)
-    if not isinstance(node_info, dict):
-        return None
-    inputs = node_info.get("input", {})
-    if not isinstance(inputs, dict):
-        return None
-    for section in ("required", "optional"):
-        section_inputs = inputs.get(section)
-        if not isinstance(section_inputs, dict):
-            continue
-        spec = section_inputs.get(field)
-        # Option-list inputs look like [["file_a", "file_b"], {...}]
-        if (
-            isinstance(spec, (list, tuple))
-            and len(spec) > 0
-            and isinstance(spec[0], list)
-        ):
-            return spec[0]
-    return None
-
-
-def get_available_models():
-    """
-    Get list of available models from ComfyUI, grouped by model type.
-
-    Queries /object_info and extracts the option list of every known model
-    loader node (see MODEL_LOADER_NODES), so the result covers checkpoints,
-    loras, vae, text encoders, diffusion models and upscale models.
-
-    Returns:
-        dict: Mapping of model type (e.g. 'checkpoints') to a sorted list of
-              available filenames. Empty dict if ComfyUI can't be reached.
-    """
-    object_info = _fetch_object_info()
-    if object_info is None:
+        print(f"worker-comfyui - Warning: Could not fetch available models: {e}")
         return {}
-
-    available_models = {}
-    for class_type, (model_type, fields) in MODEL_LOADER_NODES.items():
-        for field in fields:
-            options = _loader_field_options(object_info, class_type, field)
-            if options:
-                available_models.setdefault(model_type, set()).update(options)
-    return {model_type: sorted(files) for model_type, files in available_models.items()}
-
-
-def _format_options(options):
-    """Format an option list for an error message, truncating long lists."""
-    shown = sorted(options)[:MAX_LISTED_MODELS]
-    formatted = ", ".join(f"'{o}'" for o in shown)
-    remaining = len(options) - len(shown)
-    if remaining > 0:
-        formatted += f" (and {remaining} more)"
-    return formatted
-
-
-def _check_model_reference(object_info, node_id, class_type, field, value, model_type):
-    """
-    Validate one model-name input of a loader node.
-
-    Returns a problem description string, or None if the reference is fine
-    (or cannot be judged from /object_info).
-    """
-    volume_dir = MODEL_TYPE_VOLUME_DIRS.get(
-        model_type, f"/runpod-volume/models/{model_type}/"
-    )
-
-    if value == MODEL_LIST_PLACEHOLDER:
-        available = _loader_field_options(object_info, class_type, field) or []
-        msg = (
-            f"Node {node_id} ({class_type}.{field}): got the placeholder "
-            f"'{MODEL_LIST_PLACEHOLDER}' instead of a real model filename — the client "
-            f"sent a UI default that was never replaced with an actual file. "
-            f"Set it to one of the available {model_type} files"
-        )
-        if available:
-            msg += f": {_format_options(available)}"
-        return msg
-
-    available = _loader_field_options(object_info, class_type, field)
-    if available is None:
-        # Node type or field not registered in this ComfyUI build — let
-        # ComfyUI's own validation decide instead of guessing.
-        return None
-    if value in available:
-        return None
-
-    msg = (
-        f"Node {node_id} ({class_type}.{field}): '{value}' not found in "
-        f"{model_type}. Expected at {volume_dir}{value}"
-    )
-    # Matching mirrors ComfyUI's own validation and is case-sensitive; when a
-    # file differs only in case, say so instead of just "not found".
-    case_match = next((a for a in available if a.lower() == value.lower()), None)
-    if case_match:
-        msg += f". Did you mean '{case_match}'? (filenames are case-sensitive)"
-    elif available:
-        msg += f". Available {model_type}: {_format_options(available)}"
-    else:
-        msg += (
-            f". No {model_type} files are available — check that your network "
-            f"volume contains them under {volume_dir}"
-        )
-    return msg
-
-
-def _check_image_reference(object_info, node_id, value):
-    """
-    Validate a LoadImage 'image' input against ComfyUI's known input images.
-
-    Returns a problem description string, or None if the reference is fine.
-    """
-    if value == MODEL_LIST_PLACEHOLDER:
-        return (
-            f"Node {node_id} (LoadImage.image): got the placeholder "
-            f"'{MODEL_LIST_PLACEHOLDER}' instead of a real image filename — the client "
-            f"sent a UI default that was never replaced with an actual file"
-        )
-    available = _loader_field_options(object_info, "LoadImage", "image")
-    if available is None or value in available:
-        return None
-    # ComfyUI accepts annotated names like "example.png [input]" that are not
-    # part of the option list — don't second-guess those.
-    if value.endswith("]") and " [" in value:
-        return None
-    return (
-        f"Node {node_id} (LoadImage.image): '{value}' is not an available input "
-        f"image. Upload it via the request's 'images' parameter or place it in "
-        f"ComfyUI's input directory"
-    )
-
-
-def validate_workflow_models(workflow):
-    """
-    Pre-flight check that every model file referenced by the workflow exists.
-
-    Walks the workflow graph and, for every known model loader node, verifies
-    the referenced filename against what ComfyUI actually has registered
-    (/object_info). This surfaces every missing model in one clear error
-    *before* the workflow is submitted, instead of ComfyUI's cryptic
-    'Value not in list' validation crash after the cold start.
-
-    If /object_info can't be fetched, validation is skipped (fail open): a
-    transient error must not block a valid workflow, and queue_workflow's
-    400 handling remains as the backstop.
-
-    Args:
-        workflow (dict): The workflow graph ({node_id: {class_type, inputs}}).
-
-    Returns:
-        str: A user-facing error message listing every problem found, or None
-             if the workflow looks valid (or validation was skipped).
-    """
-    if not isinstance(workflow, dict):
-        return None
-
-    object_info = _fetch_object_info()
-    if object_info is None:
-        print(
-            "worker-comfyui - Skipping workflow model pre-flight check "
-            "(could not fetch /object_info)"
-        )
-        return None
-
-    problems = []
-    for node_id, node in workflow.items():
-        if not isinstance(node, dict):
-            continue
-        class_type = node.get("class_type")
-        inputs = node.get("inputs")
-        if not isinstance(inputs, dict):
-            continue
-
-        if class_type in MODEL_LOADER_NODES:
-            model_type, fields = MODEL_LOADER_NODES[class_type]
-            for field in fields:
-                value = inputs.get(field)
-                # Non-string values are links to other nodes' outputs
-                # ([node_id, slot]) — nothing to check.
-                if not isinstance(value, str):
-                    continue
-                problem = _check_model_reference(
-                    object_info, node_id, class_type, field, value, model_type
-                )
-                if problem:
-                    problems.append(problem)
-        elif class_type == "LoadImage":
-            value = inputs.get("image")
-            if isinstance(value, str):
-                problem = _check_image_reference(object_info, node_id, value)
-                if problem:
-                    problems.append(problem)
-
-    if not problems:
-        return None
-
-    message = (
-        "Workflow validation failed — the following referenced files are not "
-        "available on this worker:\n"
-    )
-    message += "\n".join(f"• {problem}" for problem in problems)
-    message += (
-        "\n\nUpload the missing file(s) to the matching directory on your "
-        "network volume, or update the workflow to use one of the available files."
-    )
-    return message
 
 
 def queue_workflow(workflow, client_id, comfy_org_api_key=None):
@@ -854,15 +617,6 @@ def handler(job):
                 "details": upload_result["details"],
             }
 
-    # Pre-flight: verify every model file the workflow references actually
-    # exists before submitting, so a missing model fails fast with a clear
-    # message instead of ComfyUI's raw validation crash. Runs after image
-    # upload so freshly uploaded LoadImage inputs are already visible.
-    preflight_error = validate_workflow_models(workflow)
-    if preflight_error:
-        print(f"worker-comfyui - Workflow model pre-flight failed:\n{preflight_error}")
-        return {"error": preflight_error}
-
     ws = None
     client_id = str(uuid.uuid4())
     prompt_id = None
@@ -996,9 +750,7 @@ def handler(job):
 
         print(f"worker-comfyui - Processing {len(outputs)} output nodes...")
         for node_id, node_output in outputs.items():
-            # PATCH (wan-worker): ComfyUI video nodes (SaveVideo) report saved
-            # files under "videos"/"gifs", not "images". Merge all media keys
-            # so video outputs are returned like images.
+            # PATCH (wan-worker): merge video/gif outputs so SaveVideo results are returned
             _merged_media = []
             for _mk in ("images", "videos", "gifs"):
                 _merged_media.extend(node_output.get(_mk, []))
